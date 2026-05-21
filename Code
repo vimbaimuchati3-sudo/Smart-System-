@@ -1,0 +1,158 @@
+#include <WiFiNINA.h>
+#include <SPI.h>
+#include <PubSubClient.h>
+#include <Arduino_LSM6DS3.h>
+
+// ================= WIFI & UBIDOTS =================
+const char* ssid = "Your wifi name"; 
+const char* password = "wifi password";
+const char* UBIDOTS_TOKEN = "BBUS-25gvZusTpdhRwcAuKQimApFiA7eglV"; 
+const char* DEVICE_LABEL = "fsr_system";
+
+WiFiClient wifiClient;
+PubSubClient client(wifiClient);
+const char* UBIDOTS_SERVER = "industrial.api.ubidots.com";
+
+// ================= FSR =================
+const int numSensors = 5;
+const int fsrPins[numSensors] = {A0, A1, A2, A3, A6};
+
+const float VCC = 3.3;
+const float R_FIXED = 2200.0;
+
+float forces[numSensors];
+
+// MQTT topic
+String topic = "";
+
+// ================= WIFI FUNCTION =================
+void connectWiFi() {
+  Serial.print("Connecting to WiFi: ");
+  Serial.println(ssid);
+
+  WiFi.begin(ssid, password);
+
+  int attempts = 0;
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+
+    if (attempts > 20) {
+      Serial.println("\nWiFi connection FAILED");
+      return;
+    }
+  }
+
+  Serial.println("\nWiFi connected!");
+  Serial.print("IP address: ");
+  Serial.println(WiFi.localIP());
+}
+
+// ================= MQTT FUNCTION =================
+void reconnectMQTT() {
+  while (!client.connected()) {
+    Serial.print("Connecting to MQTT...");
+
+    if (client.connect("Nano33IoT", UBIDOTS_TOKEN, "")) {
+      Serial.println("connected!");
+    } else {
+      Serial.print("failed, rc=");
+      Serial.print(client.state());
+      Serial.println(" retrying...");
+      delay(2000);
+    }
+  }
+}
+
+// ================= SETUP =================
+void setup() {
+  Serial.begin(115200);
+  delay(2000);
+
+  connectWiFi();
+
+  client.setServer(UBIDOTS_SERVER, 1883);
+
+  if (!IMU.begin()) {
+    Serial.println("IMU failed!");
+    while (1);
+  }
+
+  Serial.println("IMU initialized");
+
+  topic = "/v1.6/devices/" + String(DEVICE_LABEL);
+}
+
+// ================= LOOP =================
+void loop() {
+
+  if (WiFi.status() != WL_CONNECTED) {
+    connectWiFi();
+  }
+
+  if (!client.connected()) {
+    reconnectMQTT();
+  }
+
+  client.loop();
+
+  float totalForce = 0;
+  float maxForce = 0;
+  int maxIndex = -1;
+
+  // -------- Read FSR Sensors --------
+  for (int i = 0; i < numSensors; i++) {
+
+    int adc = analogRead(fsrPins[i]);
+    float force = 0;
+
+    if (adc > 20) {
+      float voltage = (adc / 1023.0) * VCC;
+      float rFSR = R_FIXED * (VCC / voltage - 1.0);
+      force = 2e6 * pow(rFSR, -1.64);
+    }
+
+    forces[i] = force;
+    totalForce += force;
+
+    if (force > maxForce) {
+      maxForce = force;
+      maxIndex = i;
+    }
+  }
+
+  // -------- Read IMU --------
+  float ax, ay, az;
+  IMU.readAcceleration(ax, ay, az);
+
+  float pitch = atan2(ax, sqrt(ay * ay + az * az)) * 180.0 / PI;
+  float roll  = atan2(ay, sqrt(ax * ax + az * az)) * 180.0 / PI;
+
+  // -------- Create JSON --------
+  String payload = "{";
+
+  for (int i = 0; i < numSensors; i++) {
+    payload += "\"fsr" + String(i) + "\":" + String(forces[i]) + ",";
+  }
+
+  payload += "\"total_force\":" + String(totalForce) + ",";
+  payload += "\"pitch\":" + String(pitch) + ",";
+  payload += "\"roll\":" + String(roll) + ",";
+  payload += "\"max_sensor\":" + String(maxIndex == 4 ? 6 : maxIndex);
+
+  payload += "}";
+
+  // -------- Publish --------
+  Serial.println("Sending data to Ubidots:");
+  Serial.println(payload);
+
+  if (client.publish(topic.c_str(), payload.c_str())) {
+    Serial.println("Data sent successfully\n");
+  } else {
+    Serial.println("Failed to send data\n");
+  }
+
+  delay(2000);
+}
